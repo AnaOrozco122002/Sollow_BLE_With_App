@@ -9,48 +9,58 @@
 
 // ======================= BLE UUIDs =======================
 #define SERVICE_UUID          "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define CHARACTERISTIC_UUID   "beb5483e-36e1-4688-b7f5-ea07361b26a8" // CH1: PID/Vmax/ValTurb (READ/WRITE)
-#define CHARACTERISTIC_UUID_2 "ceb5483e-36e1-4688-b7f5-ea07361b26a8" // CH2: Offset/Estado (WRITE) + Lecturas (READ)
+#define CHARACTERISTIC_UUID   "beb5483e-36e1-4688-b7f5-ea07361b26a8" // CH1: PID/Vmax/ValTurb/(KTurb opcional) (READ/WRITE)
+#define CHARACTERISTIC_UUID_2 "ceb5483e-36e1-4688-b7f5-ea07361b26a8" // CH2: Offset (WRITE) + Lecturas (READ)
 
 BLECharacteristic *pCharacteristic;    // CH1
 BLECharacteristic *pCharacteristic_2;  // CH2
 
 // ======================= MÓDULO DE INICIO =======================
 const byte MInit = D3;
-int   Estado = 0;
-
-// Control remoto del estado (via BLE)
-bool  remoteEstadoEnabled = false;
-int   remoteEstado = 0; // 0/1
+int   Estado = 0;   // 0/1 (general)
 
 // ======================= TURBINA =======================
 Servo myTurbina;
-const byte Tur = D4;
+const int Tur = D4; // PIN PWM o Servo
 int   ValTurb = 150;
-int   minvaltur = 50;
-int   maxvaltur = 180;
+
+bool is_Servo = false; //false para ser PWM (Nuevo Sollow), true para ser servo (viejo sollow)
+
+int minvaltur=0;
+int maxvaltur=0;
+
 float KTurb = 0.6f; // (si usas Esfuerzo_Turbina)
+
 
 // ======================= SENSORES QTR =======================
 #define NUM_SENSORS 16
 #define NUM_SAMPLES_PER_SENSOR 3
-#define IN_PIN A2 // PIN de entrada del MUX hacia el micro
+#define IN_PIN A1 // PIN de entrada del MUX hacia el micro
 
-// Secuencia 0..15 y select lines del MUX: D9, D10, D0, D1
+// Secuencia 0..15 y select lines del MUX: SL0,SL1,SL2,SL3
 QTRSensorsMux qtra(
   (unsigned char[]){0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15},
   NUM_SENSORS,
   NUM_SAMPLES_PER_SENSOR,
   (unsigned char)IN_PIN,
-  (unsigned char[]){ D9, D10, D0, D1 }
+  (unsigned char[]){ D9, D10, D0, D2 }
 );
 unsigned int sensorValues[NUM_SENSORS];
+
+// ======= Robustez ponderado (anti-saltos a 0/15000 cuando se pierde la línea) =======
+const uint16_t QTR_MAX_POS      = (NUM_SENSORS - 1) * 1000; // 15*1000 = 15000
+const uint16_t QTR_DETECT_TH_ON = 250;   // umbral para "apareció" línea (0..1000 calibrado)
+const uint16_t QTR_DETECT_TH_OFF= 180;   // umbral para "desapareció" (histéresis)
+const bool     QTR_INVERT_LR    = false; // true si tu arreglo quedó espejado (invierte IZQ/DER)
+
+static uint16_t lastPosRaw = QTR_MAX_POS / 2; // última pos válida (centro=7500)
+static bool     hadLine    = true;            // estado "hay línea" con histéresis
 
 // ======================= CONTROL =======================
 float Tm = 9.0f; // ms (medido por loop)
 float Referencia = 0.0f, Control = 0.0f, Kp = 2.0f, Ti = 0.0f, Td = 0.02f;
 float Salida = 0.0f, Error = 0.0f, Error_ant = 0.0f;
-float offset = 1.0f, Vmax = 1023.0f, E_integral = 0.0f;
+float offset = 1.0f, Vmax = 100.0f, E_integral = 0.0f;
 
 // Cache de lecturas para BLE (evita recomputos en READ)
 float lastSalidaNorm = 0.0f;  // normalizada [-1, +1]
@@ -58,22 +68,21 @@ float lastRawLine    = 0.0f;  // ponderada 0..~15000
 
 // ======================= BLUETOOTH (parse) =======================
 String datos;     // buffer para sintonización CH1
-String S_offset;  // buffer para offset/estado
+String S_offset;  // buffer para offset
 
 // ======================= PWM Motores =======================
 const uint16_t Frecuencia = 5000;
-const byte     Canales[]  = { 0, 1 };
+const byte     Canales[]  = { 0, 1 , 2};
 const byte     Resolucion = 10;
 
-const int PWMI = D6; // Motor Izquierdo PWM
+const int PWMI = D5; // Motor Izquierdo PWM
 const int PWMD = D8; // Motor Derecho  PWM
-const int DirI = D5; // Dirección Izquierdo
+const int DirI = D6; // Dirección Izquierdo
 const int DirD = D7; // Dirección Derecho
 
 // ======================= ESTADO RUNTIME =======================
 unsigned long Tinicio = 0;
 bool conect = false;
-bool turen  = false;
 
 // ======================= BLE CALLBACKS =======================
 class MyServerCallbacks : public BLEServerCallbacks {
@@ -89,7 +98,7 @@ class MyServerCallbacks : public BLEServerCallbacks {
   }
 };
 
-// ---- Utilidad: recorta espacios/saltos al final ----
+// ---- Utilidad: recorta CR/LF/espacios al final ----
 static String rtrim(const String& s) {
   int end = s.length() - 1;
   while (end >= 0 && (s[end] == '\r' || s[end] == '\n' || s[end] == ' ' || s[end] == '\t')) end--;
@@ -97,108 +106,108 @@ static String rtrim(const String& s) {
   return s.substring(0, end + 1);
 }
 
-// Característica 1: Kp,Ti,Td,Vmax,ValTurb (formato "*kp,ti,td,vmax,valturb")
+// Característica 1: Kp,Ti,Td,Vmax,ValTurb,(KTurb opcional)
 class MyCallbacks_1 : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pc) override {
     std::string value = pc->getValue();
     if (value.empty()) return;
 
-    // Si el fragmento actual comienza un comando, resetea el buffer
-    if (value[0] == '*') {
-      datos = "";  // limpia
-    }
+    if (value[0] == '*') datos = ""; // nuevo comando
 
-    // Acumula y normaliza separador decimal
     datos += String(value.c_str());
-    datos.replace("-", ".");
-
-    // Soporta '\n' al final, pero no es obligatorio
-    int newlineIdx = datos.indexOf('\n');
-    if (newlineIdx >= 0) {
-      datos = datos.substring(0, newlineIdx);
-    }
+    datos.replace("-", ".");   // compat decimal
+    int nl = datos.indexOf('\n');
+    if (nl >= 0) datos = datos.substring(0, nl);
     datos = rtrim(datos);
 
-    // Se espera "*a,b,c,d,e"
+    // Espera "*a,b,c,d,e" (y opcional ",f" para KTurb)
     if (datos.length() < 2 || datos[0] != '*') return;
 
-    // Encuentra comas
     int d1 = datos.indexOf(',', 1);              if (d1 < 0) return;
     int d2 = datos.indexOf(',', d1 + 1);         if (d2 < 0) return;
     int d3 = datos.indexOf(',', d2 + 1);         if (d3 < 0) return;
     int d4 = datos.indexOf(',', d3 + 1);         if (d4 < 0) return;
+    int d5 = datos.indexOf(',', d4 + 1);         // opcional KTurb
 
-    // El último campo va hasta el final (no exigimos coma extra)
-    String S_Kp      = datos.substring(1, d1);
-    String S_Ti      = datos.substring(d1 + 1, d2);
-    String S_Td      = datos.substring(d2 + 1, d3);
-    String S_Vmax    = datos.substring(d3 + 1, d4);
-    String S_ValTurb = datos.substring(d4 + 1);
+    String S_Kp      = (d1>0) ? datos.substring(1, d1) : "";
+    String S_Ti      = (d2>0) ? datos.substring(d1 + 1, d2) : "";
+    String S_Td      = (d3>0) ? datos.substring(d2 + 1, d3) : "";
+    String S_Vmax    = (d4>0) ? datos.substring(d3 + 1, d4) : "";
+    String S_ValTurb = (d5>=0) ? datos.substring(d4 + 1, d5) : datos.substring(d4 + 1);
+    String S_KTurb   = (d5>=0) ? datos.substring(d5 + 1)     : ""; // opcional
 
-    datos = ""; // limpia para el próximo
+    datos = ""; // limpia
 
     Kp      = S_Kp.toFloat();
     Ti      = S_Ti.toFloat();
     Td      = S_Td.toFloat();
     Vmax    = constrain(S_Vmax.toFloat(), 0, 1023);
     ValTurb = constrain((int)S_ValTurb.toFloat(), minvaltur, maxvaltur);
+    if (S_KTurb.length() > 0) {
+      KTurb = S_KTurb.toFloat();
+      KTurb = constrain(KTurb, 0.0f, 2.0f);
+    }
 
-    Serial.printf("[BLE CH1] kp=%.3f ti=%.3f td=%.3f vmax=%.0f turb=%d\n",
-                  Kp, Ti, Td, Vmax, ValTurb);
+    Serial.printf("[BLE CH1] kp=%.3f ti=%.3f td=%.3f vmax=%.0f turb=%d kturb=%.3f\n",
+                  Kp, Ti, Td, Vmax, ValTurb, KTurb);
 
-    // Actualiza el valor legible de CH1 (snapshot parámetros)
-    char pbuf[96];
+    // Snapshot legible
+    char pbuf[120];
     snprintf(pbuf, sizeof(pbuf),
-             "kp=%.3f,ti=%.3f,td=%.3f,vmax=%.0f,valturb=%d,offset=%.3f",
-             (double)Kp, (double)Ti, (double)Td, (double)Vmax, ValTurb, (double)offset);
+             "kp=%.3f,ti=%.3f,td=%.3f,vmax=%.0f,valturb=%d,offset=%.3f,ktur=%.3f",
+             (double)Kp, (double)Ti, (double)Td, (double)Vmax, ValTurb,
+             (double)offset, (double)KTurb);
     pc->setValue((uint8_t*)pbuf, strlen(pbuf));
   }
 
   void onRead(BLECharacteristic *pc) override {
-    // Devuelve snapshot de parámetros al hacer READ
-    char pbuf[96];
+    char pbuf[120];
     snprintf(pbuf, sizeof(pbuf),
-             "kp=%.3f,ti=%.3f,td=%.3f,vmax=%.0f,valturb=%d,offset=%.3f",
-             (double)Kp, (double)Ti, (double)Td, (double)Vmax, ValTurb, (double)offset);
+             "kp=%.3f,ti=%.3f,td=%.3f,vmax=%.0f,valturb=%d,offset=%.3f,ktur=%.3f",
+             (double)Kp, (double)Ti, (double)Td, (double)Vmax, ValTurb,
+             (double)offset, (double)KTurb);
     pc->setValue((uint8_t*)pbuf, strlen(pbuf));
   }
 };
 
-// Característica 2: WRITE para offset/estado; READ para lecturas de sensor
-// Formatos aceptados en WRITE:
-//   "OFFSET=1.0"  (o solo "1.0")
-//   "ESTADO=0"    o "ESTADO=1"
+// Característica 2: WRITE para offset; READ para lecturas de sensor
 class MyCallbacks_2 : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pc2) override {
     std::string value = pc2->getValue();
     if (value.empty()) return;
 
     S_offset = String(value.c_str());
-    S_offset.replace("-", "."); // compat con clientes raros
-    S_offset.trim();            // <-- in-place (NO asignar)
+    S_offset.replace("-", "."); // compat
+    S_offset.trim();
 
-    // Normaliza a mayúsculas para el prefijo (sin tocar números)
-    String upper = S_offset;
-    upper.toUpperCase();
+    Serial.print("[BLE CH2] RX: '"); Serial.println(S_offset);
 
-    if (upper.startsWith("ESTADO=")) {
-      int val = upper.substring(7).toInt();
-      val = (val != 0) ? 1 : 0;
-      remoteEstadoEnabled = true;
-      remoteEstado = val;
-      Serial.printf("[BLE CH2] ESTADO=%d (remoto habilitado)\n", remoteEstado);
-    } else if (upper.startsWith("OFFSET=")) {
-      String num = S_offset.substring(7);
-      offset = num.toFloat();
+    String up = S_offset; up.toUpperCase();
+    int eq = up.indexOf('=');
+    String key = up, val = "";
+    if (eq >= 0) {
+      key = up.substring(0, eq);
+      val = S_offset.substring(eq + 1); // usa original para decimales
+      val.trim();
+    } else {
+      key = up; val = S_offset;
+    }
+    key.trim();
+
+    if (key == "ESTADO") {
+      // Controla la variable global Estado desde BLE (si comentas la lectura física en loop)
+      int iv = val.toInt();
+      Estado = (iv != 0) ? 1 : 0;
+      Serial.printf("[BLE CH2] ESTADO=%d (control BLE)\n", Estado);
+    } else if (key == "OFFSET") {
+      offset = val.toFloat();
       Serial.println("[BLE CH2] OFFSET=" + String(offset));
     } else {
-      // Si solo vino un número, tómalo como offset
+      // Si solo vino un número, asume OFFSET
       bool soloNumero = true;
       for (size_t i = 0; i < S_offset.length(); ++i) {
         char c = S_offset[i];
-        if (!((c >= '0' && c <= '9') || c == '.' || c == '+' || c == '-' )) {
-          soloNumero = false; break;
-        }
+        if (!((c >= '0' && c <= '9') || c == '.' || c == '+' || c == '-' )) { soloNumero = false; break; }
       }
       if (soloNumero) {
         offset = S_offset.toFloat();
@@ -208,24 +217,25 @@ class MyCallbacks_2 : public BLECharacteristicCallbacks {
       }
     }
 
-    // Refleja offset en snapshot de parámetros (CH1)
+    // Actualiza snapshot de parámetros en CH1
     if (pCharacteristic) {
-      char pbuf[96];
+      char pbuf[120];
       snprintf(pbuf, sizeof(pbuf),
-               "kp=%.3f,ti=%.3f,td=%.3f,vmax=%.0f,valturb=%d,offset=%.3f",
-               (double)Kp, (double)Ti, (double)Td, (double)Vmax, ValTurb, (double)offset);
+        "kp=%.3f,ti=%.3f,td=%.3f,vmax=%.0f,valturb=%d,offset=%.3f,ktur=%.3f",
+        (double)Kp, (double)Ti, (double)Td, (double)Vmax, ValTurb,
+        (double)offset, (double)KTurb);
       pCharacteristic->setValue((uint8_t*)pbuf, strlen(pbuf));
     }
   }
 
   void onRead(BLECharacteristic *pc2) override {
-    // Devuelve las lecturas cacheadas para ahorrar CPU
     char sbuf[64];
     snprintf(sbuf, sizeof(sbuf), "salida=%.3f,raw=%.0f",
              (double)lastSalidaNorm, (double)lastRawLine);
     pc2->setValue((uint8_t*)sbuf, strlen(sbuf));
   }
 };
+
 
 // ======================= PROTOTIPOS =======================
 void Inicializacion_Pines();
@@ -243,79 +253,107 @@ void Inicializacion_Bluetooth();
 // ======================= SETUP =======================
 void setup() {
   Serial.begin(115200);
+  
+  if(is_Servo){
+    minvaltur = 50;
+    maxvaltur = 180;
+  }else{
+    minvaltur = 10;
+    maxvaltur = 900;
+  }
 
   Inicializacion_Pines();
-  Inicializacion_turbina();
+  if(is_Servo){
+    Inicializacion_turbina();
+  }
   Inicializacion_Sensores();
   CrearPWM();
   Inicializacion_Bluetooth();
 
-  delay(1000);
-  myTurbina.write(ValTurb); // posición inicial
+  delay(300);
+
+  if(is_Servo){
+    myTurbina.write(ValTurb); // posición inicial
+  }else{
+    ledcWrite(Canales[2], ValTurb);
+  }
 }
 
 // ======================= LOOP =======================
 void loop() {
-  // Si remoto habilitado, usamos remoteEstado; si no, leemos el pin
-  int estadoHW = digitalRead(MInit);
-  Estado = remoteEstadoEnabled ? remoteEstado : estadoHW;
+  // Lee el estado del botón físico (DEJA ESTA LÍNEA COMO ESTABA).
+  //Estado = digitalRead(MInit);               // <<< Si quieres controlar por BLE, COMENTA ESTA LÍNEA
 
   while (Estado) {
-    // Refresca Estado en cada iteración
-    int estadoLoop = remoteEstadoEnabled ? remoteEstado : digitalRead(MInit);
-    Estado = estadoLoop;
+    // Actualiza estado dentro del bucle (sigue leyendo el botón)
+    //Estado = digitalRead(MInit);            // <<< Si usas BLE para Estado, comenta también esta línea
 
     Tinicio  = millis();
-
-    Salida   = Lectura_Sensor();       // actualiza lastRawLine/lastSalidaNorm
+    Salida   = Lectura_Sensor();            // actualiza lastRawLine/lastSalidaNorm
     Control  = Controlador(Referencia, Salida);
     Esfuerzo_Control(Control);
-
     Tm       = Tiempo_Muestreo(Tinicio);
-
-    // Turbina: fija por ValTurb (o usa proporcional si lo deseas)
-    myTurbina.write(ValTurb);
-    // Esfuerzo_Turbina();
-
-    // Actualiza valor legible de CH2 (sin notificar)
-    ActualizarLecturasCache();
-
-    turen = true;
-  }
-
-  // Si salimos del while (parado)
-  if (turen) {
-    ledcWrite(Canales[0], 0);
-    ledcWrite(Canales[1], 0);
-    myTurbina.write(0);
+    // Turbina fija por ValTurb (o usa Esfuerzo_Turbina())
+    if(is_Servo){
+      myTurbina.write(ValTurb);
+      // Esfuerzo_Turbina();
+    }else{
+      ledcWrite(Canales[2], ValTurb);
+      // Esfuerzo_Turbina();
+    }
+    // Refresca valor legible CH2 (sin notify)
     ActualizarLecturasCache();
   }
 
-  // Seguridad (motores off)
+  // Al salir del while => APAGA motores y turbina
   ledcWrite(Canales[0], 0);
   ledcWrite(Canales[1], 0);
-
-  // Actualización lenta del valor legible para BLE cuando está parado
-  static uint32_t lastIdleUpd = 0;
-  uint32_t now = millis();
-  if (now - lastIdleUpd > 100) { // 10 Hz en idle
-    Lectura_Sensor();
-    ActualizarLecturasCache();
-    lastIdleUpd = now;
+  if(is_Servo){
+    myTurbina.write(0);
+  }else{
+    ledcWrite(Canales[2], 0);
   }
+  
+  ActualizarLecturasCache();
 }
 
 // ======================= FUNCIONES =======================
 
-// Lee posición de la línea y actualiza caches
+// Lee posición de la línea (ponderado) con robustez de "línea perdida"
 float Lectura_Sensor(void) {
-  // ponderada 0..~15000
-  float rl = (float)qtra.readLine(sensorValues);
-  lastRawLine = rl;
+  // Lee ponderado (0..15000) y llena sensorValues (calibrados 0..1000)
+  uint16_t pos = qtra.readLine(sensorValues);
 
-  // normalizada aprox [-1, +1]
-  Salida = (rl / 7500.0f) - 1.0f;
+  // Señal por sensor para decidir si hay línea (máximo y suma)
+  uint16_t maxv = 0;
+  uint32_t sumv = 0;
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    uint16_t v = sensorValues[i];
+    if (v > maxv) maxv = v;
+    sumv += v;
+  }
+
+  // Histéresis para "línea presente"
+  bool lineNow = hadLine
+                 ? (maxv > QTR_DETECT_TH_OFF)   // mantener con menos señal
+                 : (maxv > QTR_DETECT_TH_ON);   // aparecer con más señal
+  hadLine = lineNow;
+
+  // Si no hay línea, mantenemos última válida (evita salto a 0/15000 del readLine)
+  uint16_t posStable = lineNow ? pos : lastPosRaw;
+
+  // Inversión Izq/Der 
+  if (QTR_INVERT_LR) {
+    posStable = QTR_MAX_POS - posStable;
+  }
+
+  // Exporta ambas lecturas
+  lastRawLine = (float)posStable;                                      // 0..15000 estable
+  Salida      = ((float)posStable / (QTR_MAX_POS / 2.0f)) - 1.0f;      // ~[-1,+1]
   lastSalidaNorm = Salida;
+
+  // Guarda la última válida para la próxima vuelta
+  if (lineNow) lastPosRaw = posStable;
 
   return Salida;
 }
@@ -335,10 +373,11 @@ float Controlador(float Ref, float Y) {
 
   Error = Ref - Y;
 
+  /*
   // Zona muerta +/-0.2
   if ((Error > -0.2f && Error < 0.0f) || (Error > 0.0f && Error < 0.2f)) {
     Error = 0.0f;
-  }
+  }*/
 
   // Integración trapezoidal
   float Ts = Tm / 1000.0f; // seg
@@ -377,7 +416,12 @@ void Esfuerzo_Control(float U) {
 void Esfuerzo_Turbina(){
   float estur = constrain(round(minvaltur + ((KTurb * fabs(Error)) * (maxvaltur - minvaltur))),
                           (float)minvaltur, (float)maxvaltur);
-  myTurbina.write((int)estur);
+  if(is_Servo){
+    myTurbina.write((int)estur);
+  }else{
+    ledcWrite(Canales[2], (int)estur);
+  }
+  
 }
 
 unsigned long Tiempo_Muestreo(unsigned long TinicioRef) {
@@ -387,10 +431,16 @@ unsigned long Tiempo_Muestreo(unsigned long TinicioRef) {
 void CrearPWM() {
   ledcSetup(Canales[0], Frecuencia, Resolucion);
   ledcSetup(Canales[1], Frecuencia, Resolucion);
+  ledcSetup(Canales[2], Frecuencia, Resolucion);
   ledcAttachPin(PWMD, Canales[0]); // CH0 -> Motor Derecho
   ledcAttachPin(PWMI, Canales[1]); // CH1 -> Motor Izquierdo
+  if(!is_Servo){
+    ledcAttachPin(Tur, Canales[2]);
+  }
 }
 
+
+//PARA TURBINA COMO SERVO
 void Inicializacion_turbina() {
   ESP32PWM::allocateTimer(2);
   myTurbina.setPeriodHertz(50);
@@ -410,8 +460,11 @@ void Inicializacion_Pines() {
   pinMode(PWMI, OUTPUT);
   pinMode(DirI, OUTPUT);
   pinMode(DirD, OUTPUT);
-  pinMode(MInit, INPUT);
-
+  pinMode(MInit, INPUT); // << como lo tenías
+  if(!is_Servo){
+    pinMode(Tur, OUTPUT);
+    ledcWrite(Canales[2], 0);
+  }
   // Estados iniciales seguros
   digitalWrite(DirI, LOW);
   digitalWrite(DirD, LOW);
@@ -421,8 +474,6 @@ void Inicializacion_Pines() {
 
 void Inicializacion_Bluetooth() {
   BLEDevice::init("SOLLOW");
-
-  // Ampliar MTU para mensajes largos
   BLEDevice::setMTU(185);
 
   BLEServer *pServer = BLEDevice::createServer();
@@ -430,30 +481,27 @@ void Inicializacion_Bluetooth() {
 
   BLEService *pService = pServer->createService(SERVICE_UUID);
 
-  // Característica 1: READ/WRITE (sin notify)
+  // CH1: READ/WRITE
   pCharacteristic = pService->createCharacteristic(
     CHARACTERISTIC_UUID,
-    BLECharacteristic::PROPERTY_READ   |
-    BLECharacteristic::PROPERTY_WRITE
+    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE
   );
   pCharacteristic->setCallbacks(new MyCallbacks_1());
-  // Valor inicial legible
   {
-    char pbuf[96];
+    char pbuf[120];
     snprintf(pbuf, sizeof(pbuf),
-             "kp=%.3f,ti=%.3f,td=%.3f,vmax=%.0f,valturb=%d,offset=%.3f",
-             (double)Kp, (double)Ti, (double)Td, (double)Vmax, ValTurb, (double)offset);
+             "kp=%.3f,ti=%.3f,td=%.3f,vmax=%.0f,valturb=%d,offset=%.3f,ktur=%.3f",
+             (double)Kp, (double)Ti, (double)Td, (double)Vmax, ValTurb,
+             (double)offset, (double)KTurb);
     pCharacteristic->setValue((uint8_t*)pbuf, strlen(pbuf));
   }
 
-  // Característica 2: WRITE para offset/estado; READ para lecturas
+  // CH2: READ/WRITE
   pCharacteristic_2 = pService->createCharacteristic(
     CHARACTERISTIC_UUID_2,
-    BLECharacteristic::PROPERTY_READ   |
-    BLECharacteristic::PROPERTY_WRITE
+    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE
   );
   pCharacteristic_2->setCallbacks(new MyCallbacks_2());
-  // Valor inicial de lecturas
   {
     char sbuf[64];
     snprintf(sbuf, sizeof(sbuf), "salida=%.3f,raw=%.0f",
@@ -463,7 +511,6 @@ void Inicializacion_Bluetooth() {
 
   pService->start();
 
-  // Advertising con UUID del servicio
   BLEAdvertising *pAdvertising = pServer->getAdvertising();
   pAdvertising->addServiceUUID(SERVICE_UUID);
   pAdvertising->setScanResponse(true);
