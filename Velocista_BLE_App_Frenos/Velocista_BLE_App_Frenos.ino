@@ -5,7 +5,7 @@
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEServer.h>
-#include <math.h>   // por fabs()
+#include <math.h>   // por fabsf()
 
 // ======================= BLE UUIDs =======================
 #define SERVICE_UUID          "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
@@ -24,20 +24,16 @@ Servo myTurbina;
 const int Tur = D4; // PIN PWM o Servo
 int   ValTurb = 150;
 
-bool is_Servo = false; //false para ser PWM (Nuevo Sollow), true para ser servo (viejo sollow)
-
+bool is_Servo = false; // false: PWM (nuevo Sollow), true: servo (viejo Sollow)
 int minvaltur=0;
 int maxvaltur=0;
-
 float KTurb = 0.6f; // (si usas Esfuerzo_Turbina)
-
 
 // ======================= SENSORES QTR =======================
 #define NUM_SENSORS 16
 #define NUM_SAMPLES_PER_SENSOR 3
 #define IN_PIN A1 // PIN de entrada del MUX hacia el micro
 
-// Secuencia 0..15 y select lines del MUX: SL0,SL1,SL2,SL3
 QTRSensorsMux qtra(
   (unsigned char[]){0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15},
   NUM_SENSORS,
@@ -59,8 +55,29 @@ static bool     hadLine    = true;            // estado "hay línea" con histér
 // ======================= CONTROL =======================
 float Tm = 9.0f; // ms (medido por loop)
 float Referencia = 0.0f, Control = 0.0f, Kp = 2.0f, Ti = 0.0f, Td = 0.02f;
-float Salida = 0.0f, Error = 0.0f, Error_ant = 0.0f;
+float Salida = 0.0f, Error = 0.0f, Error_ant = 0.0f, dError = 0.0f;
 float offset = 1.0f, Vmax = 100.0f, E_integral = 0.0f;
+
+// ======= FRENADO ADAPTATIVO (CURVA) =======
+// Límite inferior de velocidad (piso) y rampa
+float Vmin = 40.0f;          // PWM mínimo en rectas muy lentas / salida segura
+float V_aplicada = 0.0f;     // PWM realmente aplicado tras la política
+
+// Sensores de curva (ajusta a gusto)
+float TH_ERR   = 0.6f;       // error normalizado a partir del cual considero "curva"
+float TH_DERR  = 4.0f;       // |dE/dt| en 1/s (derivada) que indica giro brusco
+int   ACTIVE_LO = 2;         // sensores sobre umbral para "piso" de ancho
+int   ACTIVE_HI = 6;         // sensores sobre umbral para "techo" de ancho
+
+// Pesos del score de curva (deben sumar ~1, pero no es obligatorio)
+float W_ERR  = 0.55f;        // peso de |E|
+float W_DERR = 0.35f;        // peso de |dE/dt|
+float W_WID  = 0.10f;        // peso de ancho (nº de sensores activos)
+
+// Forma de la reducción y rampas
+float GAMMA_SHAPE = 1.0f;   // >1 reduce más agresivo al acercarse a 1
+float RAMP_UP_PPS = 1200.0f; // subida máx (PWM por segundo)
+float RAMP_DN_PPS = 2000.0f; // bajada máx (frenado rápido)
 
 // Cache de lecturas para BLE (evita recomputos en READ)
 float lastSalidaNorm = 0.0f;  // normalizada [-1, +1]
@@ -72,7 +89,7 @@ String S_offset;  // buffer para offset
 
 // ======================= PWM Motores =======================
 const uint16_t Frecuencia = 5000;
-const byte     Canales[]  = { 0, 1 , 2};
+const byte     Canales[]  = { 0, 1 , 2 };
 const byte     Resolucion = 10;
 
 const int PWMI = D5; // Motor Izquierdo PWM
@@ -93,12 +110,11 @@ class MyServerCallbacks : public BLEServerCallbacks {
   void onDisconnect(BLEServer* pServer) override {
     conect = false;
     Serial.println("Cliente desconectado.");
-    pServer->getAdvertising()->start(); // Reinicia advertising
+    pServer->getAdvertising()->start();
     Serial.println("Publicidad BLE reiniciada.");
   }
 };
 
-// ---- Utilidad: recorta CR/LF/espacios al final ----
 static String rtrim(const String& s) {
   int end = s.length() - 1;
   while (end >= 0 && (s[end] == '\r' || s[end] == '\n' || s[end] == ' ' || s[end] == '\t')) end--;
@@ -141,7 +157,7 @@ class MyCallbacks_1 : public BLECharacteristicCallbacks {
     Kp      = S_Kp.toFloat();
     Ti      = S_Ti.toFloat();
     Td      = S_Td.toFloat();
-    Vmax    = constrain(S_Vmax.toFloat(), 0, 1023);
+    Vmax    = constrain(S_Vmax.toFloat(), 0, 1023); // techo de velocidad
     ValTurb = constrain((int)S_ValTurb.toFloat(), minvaltur, maxvaltur);
     if (S_KTurb.length() > 0) {
       KTurb = S_KTurb.toFloat();
@@ -151,8 +167,7 @@ class MyCallbacks_1 : public BLECharacteristicCallbacks {
     Serial.printf("[BLE CH1] kp=%.3f ti=%.3f td=%.3f vmax=%.0f turb=%d kturb=%.3f\n",
                   Kp, Ti, Td, Vmax, ValTurb, KTurb);
 
-    // Snapshot legible
-    char pbuf[120];
+    char pbuf[140];
     snprintf(pbuf, sizeof(pbuf),
              "kp=%.3f,ti=%.3f,td=%.3f,vmax=%.0f,valturb=%d,offset=%.3f,ktur=%.3f",
              (double)Kp, (double)Ti, (double)Td, (double)Vmax, ValTurb,
@@ -161,7 +176,7 @@ class MyCallbacks_1 : public BLECharacteristicCallbacks {
   }
 
   void onRead(BLECharacteristic *pc) override {
-    char pbuf[120];
+    char pbuf[140];
     snprintf(pbuf, sizeof(pbuf),
              "kp=%.3f,ti=%.3f,td=%.3f,vmax=%.0f,valturb=%d,offset=%.3f,ktur=%.3f",
              (double)Kp, (double)Ti, (double)Td, (double)Vmax, ValTurb,
@@ -187,7 +202,7 @@ class MyCallbacks_2 : public BLECharacteristicCallbacks {
     String key = up, val = "";
     if (eq >= 0) {
       key = up.substring(0, eq);
-      val = S_offset.substring(eq + 1); // usa original para decimales
+      val = S_offset.substring(eq + 1);
       val.trim();
     } else {
       key = up; val = S_offset;
@@ -195,7 +210,6 @@ class MyCallbacks_2 : public BLECharacteristicCallbacks {
     key.trim();
 
     if (key == "ESTADO") {
-      // Controla la variable global Estado desde BLE (si comentas la lectura física en loop)
       int iv = val.toInt();
       Estado = (iv != 0) ? 1 : 0;
       Serial.printf("[BLE CH2] ESTADO=%d (control BLE)\n", Estado);
@@ -203,7 +217,6 @@ class MyCallbacks_2 : public BLECharacteristicCallbacks {
       offset = val.toFloat();
       Serial.println("[BLE CH2] OFFSET=" + String(offset));
     } else {
-      // Si solo vino un número, asume OFFSET
       bool soloNumero = true;
       for (size_t i = 0; i < S_offset.length(); ++i) {
         char c = S_offset[i];
@@ -217,9 +230,8 @@ class MyCallbacks_2 : public BLECharacteristicCallbacks {
       }
     }
 
-    // Actualiza snapshot de parámetros en CH1
     if (pCharacteristic) {
-      char pbuf[120];
+      char pbuf[140];
       snprintf(pbuf, sizeof(pbuf),
         "kp=%.3f,ti=%.3f,td=%.3f,vmax=%.0f,valturb=%d,offset=%.3f,ktur=%.3f",
         (double)Kp, (double)Ti, (double)Td, (double)Vmax, ValTurb,
@@ -229,13 +241,12 @@ class MyCallbacks_2 : public BLECharacteristicCallbacks {
   }
 
   void onRead(BLECharacteristic *pc2) override {
-    char sbuf[64];
+    char sbuf[80];
     snprintf(sbuf, sizeof(sbuf), "salida=%.3f,raw=%.0f",
              (double)lastSalidaNorm, (double)lastRawLine);
     pc2->setValue((uint8_t*)sbuf, strlen(sbuf));
   }
 };
-
 
 // ======================= PROTOTIPOS =======================
 void Inicializacion_Pines();
@@ -249,6 +260,10 @@ void  Esfuerzo_Control(float Control);
 void  Esfuerzo_Turbina();
 unsigned long Tiempo_Muestreo(unsigned long Tinicio);
 void Inicializacion_Bluetooth();
+
+// --- Frenado adaptativo ---
+float   ComputeCurveScore(float err, float derr);
+void    ActualizarVelocidad();  // ajusta V_aplicada con rampas
 
 // ======================= SETUP =======================
 void setup() {
@@ -272,8 +287,10 @@ void setup() {
 
   delay(300);
 
+  // Estado inicial seguro
+  V_aplicada = Vmin; // empezamos lento
   if(is_Servo){
-    myTurbina.write(ValTurb); // posición inicial
+    myTurbina.write(ValTurb);
   }else{
     ledcWrite(Canales[2], ValTurb);
   }
@@ -281,27 +298,34 @@ void setup() {
 
 // ======================= LOOP =======================
 void loop() {
-  // Lee el estado del botón físico (DEJA ESTA LÍNEA COMO ESTABA).
-  //Estado = digitalRead(MInit);               // <<< Si quieres controlar por BLE, COMENTA ESTA LÍNEA
+  //Estado = digitalRead(MInit); // << si quieres controlar por BLE, deja comentado
 
   while (Estado) {
-    // Actualiza estado dentro del bucle (sigue leyendo el botón)
-    //Estado = digitalRead(MInit);            // <<< Si usas BLE para Estado, comenta también esta línea
+    //Estado = digitalRead(MInit);
 
     Tinicio  = millis();
-    Salida   = Lectura_Sensor();            // actualiza lastRawLine/lastSalidaNorm
-    Control  = Controlador(Referencia, Salida);
+    Salida   = Lectura_Sensor();            // actualiza lastRawLine/lastSalidaNorm y Error
+    Control  = Controlador(Referencia, Salida); // también rellena dError
+    ActualizarVelocidad();                  // <-- calcula V_aplicada con frenado adaptativo
     Esfuerzo_Control(Control);
-    Tm       = Tiempo_Muestreo(Tinicio);
-    // Turbina fija por ValTurb (o usa Esfuerzo_Turbina())
+
+    // Turbina fija (o ligada al frenado si deseas, ver abajo)
     if(is_Servo){
+      // myTurbina.write(ValTurb);
+      // Si quieres que acompañe la reducción en curvas:
+      /*int tcmd = map((int)V_aplicada, 0, (int)max(1.0f, Vmax), minvaltur, maxvaltur);
+      myTurbina.write(constrain(tcmd, minvaltur, maxvaltur));*/
       myTurbina.write(ValTurb);
-      // Esfuerzo_Turbina();
+      // Esfuerzo_Turbina(); // alternativo proporcional a |Error|
     }else{
+      // ledcWrite(Canales[2], ValTurb);
+      /*int tcmd = map((int)V_aplicada, 0, (int)max(1.0f, Vmax), minvaltur, maxvaltur);
+      ledcWrite(Canales[2], constrain(tcmd, minvaltur, maxvaltur));*/
       ledcWrite(Canales[2], ValTurb);
-      // Esfuerzo_Turbina();
+      // Esfuerzo_Turbina(); // alternativo proporcional a |Error|
     }
-    // Refresca valor legible CH2 (sin notify)
+
+    Tm       = Tiempo_Muestreo(Tinicio);
     ActualizarLecturasCache();
   }
 
@@ -321,10 +345,9 @@ void loop() {
 
 // Lee posición de la línea (ponderado) con robustez de "línea perdida"
 float Lectura_Sensor(void) {
-  // Lee ponderado (0..15000) y llena sensorValues (calibrados 0..1000)
   uint16_t pos = qtra.readLine(sensorValues);
   pos = 15000 - pos;
-  // Señal por sensor para decidir si hay línea (máximo y suma)
+
   uint16_t maxv = 0;
   uint32_t sumv = 0;
   for (int i = 0; i < NUM_SENSORS; i++) {
@@ -333,26 +356,21 @@ float Lectura_Sensor(void) {
     sumv += v;
   }
 
-  // Histéresis para "línea presente"
   bool lineNow = hadLine
-                 ? (maxv > QTR_DETECT_TH_OFF)   // mantener con menos señal
-                 : (maxv > QTR_DETECT_TH_ON);   // aparecer con más señal
+                 ? (maxv > QTR_DETECT_TH_OFF)
+                 : (maxv > QTR_DETECT_TH_ON);
   hadLine = lineNow;
 
-  // Si no hay línea, mantenemos última válida (evita salto a 0/15000 del readLine)
   uint16_t posStable = lineNow ? pos : lastPosRaw;
 
-  // Inversión Izq/Der 
   if (QTR_INVERT_LR) {
     posStable = QTR_MAX_POS - posStable;
   }
 
-  // Exporta ambas lecturas
-  lastRawLine = (float)posStable;                                      // 0..15000 estable
-  Salida      = ((float)posStable / (QTR_MAX_POS / 2.0f)) - 1.0f;      // ~[-1,+1]
+  lastRawLine    = (float)posStable;                                 // 0..15000
+  Salida         = ((float)posStable / (QTR_MAX_POS / 2.0f)) - 1.0f; // ~[-1,+1]
   lastSalidaNorm = Salida;
 
-  // Guarda la última válida para la próxima vuelta
   if (lineNow) lastPosRaw = posStable;
 
   return Salida;
@@ -366,67 +384,56 @@ void ActualizarLecturasCache() {
   pCharacteristic_2->setValue((uint8_t*)sbuf, strlen(sbuf));
 }
 
-// Controlador PID (forma estándar con anti-windup y zona muerta pequeña)
+// Controlador PID (forma estándar con anti-windup)
 float Controlador(float Ref, float Y) {
   float E_derivativo;
   float U;
 
   Error = Ref - Y;
 
-  
-  // Zona muerta +/-0.1
+    // Zona muerta +/-0.1
   if ((Error > -0.1f && Error < 0.0f) || (Error > 0.0f && Error < 0.1f)) {
     Error = 0.0f;
   }
 
-  // Integración trapezoidal
-  float Ts = Tm / 1000.0f; // seg
+  float Ts = max(Tm / 1000.0f, 1e-3f); // seg
   E_integral += ((Error * Ts) + (Ts * (Error - Error_ant)) / 2.0f);
   E_integral = constrain(E_integral, -100.0f, 100.0f);
 
-  // Derivada
-  E_derivativo = (Error - Error_ant) / max(Ts, 1e-3f);
+  E_derivativo = (Error - Error_ant) / Ts;
+  dError = E_derivativo; // <-- exponemos dE/dt para la política de frenado
 
   U = Kp * (Error + Ti * E_integral + Td * E_derivativo);
   Error_ant = Error;
 
-  // Saturación salida control
   U = constrain(U, -2.5f, 2.5f);
   return U;
 }
 
-// Envía PWM a motores según offset +/- Control
+// Envía PWM a motores según offset +/- Control, usando V_aplicada (no Vmax)
 void Esfuerzo_Control(float U) {
   float s1 = (offset - U); // Derecho
   float s2 = (offset + U); // Izquierdo
 
-  // Magnitud PWM
-  int pwm1 = floor(constrain(fabs(s1), 0.0f, 1.0f) * Vmax);
-  int pwm2 = floor(constrain(fabs(s2), 0.0f, 1.0f) * Vmax);
+  int pwm1 = floor(constrain(fabsf(s1), 0.0f, 1.0f) * V_aplicada);
+  int pwm2 = floor(constrain(fabsf(s2), 0.0f, 1.0f) * V_aplicada);
 
   ledcWrite(Canales[0], pwm1);
   ledcWrite(Canales[1], pwm2);
 
-  // Direcciones
-  /*
-  digitalWrite(DirD, (s1 <= 0.0f) ? HIGH  : LOW);
-  digitalWrite(DirI, (s2 <= 0.0f) ? HIGH  : LOW);*/
-  
   digitalWrite(DirD, (s1 <= 0.0f) ? LOW  : HIGH);
   digitalWrite(DirI, (s2 <= 0.0f) ? LOW  : HIGH);
-  
 }
 
-// Turbina proporcional al |Error| (opcional)
+// Turbina proporcional al |Error| (alternativo, si lo prefieres)
 void Esfuerzo_Turbina(){
-  float estur = constrain(round(minvaltur + ((KTurb * fabs(Error)) * (maxvaltur - minvaltur))),
+  float estur = constrain(round(minvaltur + ((KTurb * fabsf(Error)) * (maxvaltur - minvaltur))),
                           (float)minvaltur, (float)maxvaltur);
   if(is_Servo){
     myTurbina.write((int)estur);
   }else{
     ledcWrite(Canales[2], (int)estur);
   }
-  
 }
 
 unsigned long Tiempo_Muestreo(unsigned long TinicioRef) {
@@ -444,7 +451,6 @@ void CrearPWM() {
   }
 }
 
-
 //PARA TURBINA COMO SERVO
 void Inicializacion_turbina() {
   ESP32PWM::allocateTimer(2);
@@ -454,7 +460,6 @@ void Inicializacion_turbina() {
 }
 
 void Inicializacion_Sensores() {
-  // Calibración simple de QTR
   for (int i = 0; i < 300; i++) {
     qtra.calibrate(); // ~25ms por llamada
   }
@@ -465,12 +470,11 @@ void Inicializacion_Pines() {
   pinMode(PWMI, OUTPUT);
   pinMode(DirI, OUTPUT);
   pinMode(DirD, OUTPUT);
-  pinMode(MInit, INPUT); // << como lo tenías
+  pinMode(MInit, INPUT);
   if(!is_Servo){
     pinMode(Tur, OUTPUT);
     ledcWrite(Canales[2], 0);
   }
-  // Estados iniciales seguros
   digitalWrite(DirI, LOW);
   digitalWrite(DirD, LOW);
   ledcWrite(Canales[0], 0);
@@ -493,7 +497,7 @@ void Inicializacion_Bluetooth() {
   );
   pCharacteristic->setCallbacks(new MyCallbacks_1());
   {
-    char pbuf[120];
+    char pbuf[140];
     snprintf(pbuf, sizeof(pbuf),
              "kp=%.3f,ti=%.3f,td=%.3f,vmax=%.0f,valturb=%d,offset=%.3f,ktur=%.3f",
              (double)Kp, (double)Ti, (double)Td, (double)Vmax, ValTurb,
@@ -508,7 +512,7 @@ void Inicializacion_Bluetooth() {
   );
   pCharacteristic_2->setCallbacks(new MyCallbacks_2());
   {
-    char sbuf[64];
+    char sbuf[80];
     snprintf(sbuf, sizeof(sbuf), "salida=%.3f,raw=%.0f",
              (double)lastSalidaNorm, (double)lastRawLine);
     pCharacteristic_2->setValue((uint8_t*)sbuf, strlen(sbuf));
@@ -522,4 +526,57 @@ void Inicializacion_Bluetooth() {
   pAdvertising->start();
 
   Serial.println("BLE Advertising iniciado (SOLLOW).");
+}
+
+// ======================= FRENADO ADAPTATIVO =======================
+
+// Calcula un score de curva ∈ [0,1] usando |E|, |dE/dt| y ancho de línea
+float ComputeCurveScore(float err, float derr) {
+  // 1) componente por |E|
+  float a = err / TH_ERR;
+  a = fabsf(a);
+  a = constrain(a, 0.0f, 1.0f);
+
+  // 2) componente por |dE/dt|
+  float b = fabsf(derr) / TH_DERR;
+  b = constrain(b, 0.0f, 1.0f);
+
+  // 3) componente por ancho (número de sensores por encima de umbral OFF)
+  int active = 0;
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    if ((int)sensorValues[i] > (int)QTR_DETECT_TH_OFF) active++;
+  }
+  float c = 0.0f;
+  if (ACTIVE_HI > ACTIVE_LO) {
+    c = (float)(active - ACTIVE_LO) / (float)(ACTIVE_HI - ACTIVE_LO);
+  }
+  c = constrain(c, 0.0f, 1.0f);
+
+  // combinación ponderada
+  float score = (W_ERR * a) + (W_DERR * b) + (W_WID * c);
+  score = constrain(score, 0.0f, 1.0f);
+  return score;
+}
+
+// Actualiza V_aplicada a partir del score, con rampas de subida/bajada
+void ActualizarVelocidad() {
+  float score = ComputeCurveScore(Error, dError);
+
+  // target = Vmin + (Vmax - 0) * (1 - score)^gamma, pero dejamos Vmax como techo directo
+  float reduct = powf(constrain(1.0f - score, 0.0f, 1.0f), GAMMA_SHAPE);
+  float target = Vmin + (Vmax - Vmin) * reduct;
+
+  // ramp limiter (en unidades PWM)
+  float dt = max(Tm / 1000.0f, 1e-3f);
+  float up = RAMP_UP_PPS * dt;
+  float dn = RAMP_DN_PPS * dt;
+
+  if (target > V_aplicada) {
+    V_aplicada = min(target, V_aplicada + up);
+  } else {
+    V_aplicada = max(target, V_aplicada - dn);
+  }
+
+  // seguridad
+  V_aplicada = constrain(V_aplicada, Vmin, Vmax);
 }
