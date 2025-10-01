@@ -10,7 +10,7 @@
 // ======================= BLE UUIDs =======================
 #define SERVICE_UUID          "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define CHARACTERISTIC_UUID   "beb5483e-36e1-4688-b7f5-ea07361b26a8" // CH1: PID/Vmax/ValTurb/(KTurb opcional) (READ/WRITE)
-#define CHARACTERISTIC_UUID_2 "ceb5483e-36e1-4688-b7f5-ea07361b26a8" // CH2: Offset (WRITE) + Lecturas (READ)
+#define CHARACTERISTIC_UUID_2 "ceb5483e-36e1-4688-b7f5-ea07361b26a8" // CH2: Offset/Estado/THs (WRITE) + Lecturas (READ)
 
 BLECharacteristic *pCharacteristic;    // CH1
 BLECharacteristic *pCharacteristic_2;  // CH2
@@ -22,6 +22,7 @@ int   Estado = 0;   // 0/1 (general)
 // ======================= TURBINA =======================
 Servo myTurbina;
 const int Tur = D4; // PIN PWM o Servo
+
 int   ValTurb = 150;
 
 bool is_Servo = false; //false para ser PWM (Nuevo Sollow), true para ser servo (viejo sollow)
@@ -30,7 +31,6 @@ int minvaltur=0;
 int maxvaltur=0;
 
 float KTurb = 0.6f; // (si usas Esfuerzo_Turbina)
-
 
 // ======================= SENSORES QTR =======================
 #define NUM_SENSORS 16
@@ -48,16 +48,18 @@ QTRSensorsMux qtra(
 unsigned int sensorValues[NUM_SENSORS];
 
 // ======= Robustez ponderado (anti-saltos a 0/15000 cuando se pierde la línea) =======
-const uint16_t QTR_MAX_POS      = (NUM_SENSORS - 1) * 1000; // 15*1000 = 15000
-const uint16_t QTR_DETECT_TH_ON = 250;   // umbral para "apareció" línea (0..1000 calibrado)
-const uint16_t QTR_DETECT_TH_OFF= 180;   // umbral para "desapareció" (histéresis)
-const bool     QTR_INVERT_LR    = false; // true si tu arreglo quedó espejado (invierte IZQ/DER)
+const uint16_t QTR_MAX_POS   = (NUM_SENSORS - 1) * 1000; // 15*1000 = 15000
+const bool     QTR_INVERT_LR = false; // true si tu arreglo quedó espejado (invierte IZQ/DER)
+
+// Umbrales AJUSTABLES por BLE (rango 0..1000 tras calibración)
+uint16_t qtr_th_on  = 520;  // "apareció" línea
+uint16_t qtr_th_off = 320;  // "desapareció" línea (histeresis) -> debe ser < qtr_th_on
 
 static uint16_t lastPosRaw = QTR_MAX_POS / 2; // última pos válida (centro=7500)
 static bool     hadLine    = true;            // estado "hay línea" con histéresis
 
 // ======================= CONTROL =======================
-float Tm = 9.0f; // ms (medido por loop)
+float Tm = 4.0f; // ms (medido por loop)
 float Referencia = 0.0f, Control = 0.0f, Kp = 2.0f, Ti = 0.0f, Td = 0.02f;
 float Salida = 0.0f, Error = 0.0f, Error_ant = 0.0f;
 float offset = 1.0f, Vmax = 100.0f, E_integral = 0.0f;
@@ -152,7 +154,7 @@ class MyCallbacks_1 : public BLECharacteristicCallbacks {
                   Kp, Ti, Td, Vmax, ValTurb, KTurb);
 
     // Snapshot legible
-    char pbuf[120];
+    char pbuf[160];
     snprintf(pbuf, sizeof(pbuf),
              "kp=%.3f,ti=%.3f,td=%.3f,vmax=%.0f,valturb=%d,offset=%.3f,ktur=%.3f",
              (double)Kp, (double)Ti, (double)Td, (double)Vmax, ValTurb,
@@ -161,7 +163,7 @@ class MyCallbacks_1 : public BLECharacteristicCallbacks {
   }
 
   void onRead(BLECharacteristic *pc) override {
-    char pbuf[120];
+    char pbuf[160];
     snprintf(pbuf, sizeof(pbuf),
              "kp=%.3f,ti=%.3f,td=%.3f,vmax=%.0f,valturb=%d,offset=%.3f,ktur=%.3f",
              (double)Kp, (double)Ti, (double)Td, (double)Vmax, ValTurb,
@@ -170,7 +172,7 @@ class MyCallbacks_1 : public BLECharacteristicCallbacks {
   }
 };
 
-// Característica 2: WRITE para offset; READ para lecturas de sensor
+// Característica 2: WRITE para offset/estado/umbrales; READ para lecturas de sensor + umbrales
 class MyCallbacks_2 : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pc2) override {
     std::string value = pc2->getValue();
@@ -195,13 +197,34 @@ class MyCallbacks_2 : public BLECharacteristicCallbacks {
     key.trim();
 
     if (key == "ESTADO") {
-      // Controla la variable global Estado desde BLE (si comentas la lectura física en loop)
       int iv = val.toInt();
       Estado = (iv != 0) ? 1 : 0;
       Serial.printf("[BLE CH2] ESTADO=%d (control BLE)\n", Estado);
+
     } else if (key == "OFFSET") {
       offset = val.toFloat();
       Serial.println("[BLE CH2] OFFSET=" + String(offset));
+
+    } else if (key == "TH_ON") {
+      int v = val.toInt();
+      v = constrain(v, 0, 1000);
+      qtr_th_on = v;
+      // Garantiza histéresis: off < on
+      if (qtr_th_off >= qtr_th_on) {
+        qtr_th_off = (qtr_th_on > 10) ? (qtr_th_on - 10) : 0;
+      }
+      Serial.printf("[BLE CH2] TH_ON=%u (ajustada TH_OFF=%u si era >=)\n", qtr_th_on, qtr_th_off);
+
+    } else if (key == "TH_OFF") {
+      int v = val.toInt();
+      v = constrain(v, 0, 1000);
+      // Asegura off < on
+      if (v >= (int)qtr_th_on) {
+        v = (qtr_th_on > 10) ? (qtr_th_on - 10) : 0;
+      }
+      qtr_th_off = v;
+      Serial.printf("[BLE CH2] TH_OFF=%u\n", qtr_th_off);
+
     } else {
       // Si solo vino un número, asume OFFSET
       bool soloNumero = true;
@@ -213,13 +236,13 @@ class MyCallbacks_2 : public BLECharacteristicCallbacks {
         offset = S_offset.toFloat();
         Serial.println("[BLE CH2] OFFSET=" + String(offset));
       } else {
-        Serial.println("[BLE CH2] Comando no reconocido (use OFFSET=... o ESTADO=0/1).");
+        Serial.println("[BLE CH2] Comando no reconocido (use OFFSET=..., ESTADO=0/1, TH_ON=..., TH_OFF=...).");
       }
     }
 
     // Actualiza snapshot de parámetros en CH1
     if (pCharacteristic) {
-      char pbuf[120];
+      char pbuf[160];
       snprintf(pbuf, sizeof(pbuf),
         "kp=%.3f,ti=%.3f,td=%.3f,vmax=%.0f,valturb=%d,offset=%.3f,ktur=%.3f",
         (double)Kp, (double)Ti, (double)Td, (double)Vmax, ValTurb,
@@ -229,13 +252,13 @@ class MyCallbacks_2 : public BLECharacteristicCallbacks {
   }
 
   void onRead(BLECharacteristic *pc2) override {
-    char sbuf[64];
-    snprintf(sbuf, sizeof(sbuf), "salida=%.3f,raw=%.0f",
-             (double)lastSalidaNorm, (double)lastRawLine);
+    char sbuf[96];
+    snprintf(sbuf, sizeof(sbuf), "salida=%.3f,raw=%.0f,th_on=%u,th_off=%u",
+             (double)lastSalidaNorm, (double)lastRawLine,
+             (unsigned)qtr_th_on, (unsigned)qtr_th_off);
     pc2->setValue((uint8_t*)sbuf, strlen(sbuf));
   }
 };
-
 
 // ======================= PROTOTIPOS =======================
 void Inicializacion_Pines();
@@ -281,27 +304,22 @@ void setup() {
 
 // ======================= LOOP =======================
 void loop() {
-  // Lee el estado del botón físico (DEJA ESTA LÍNEA COMO ESTABA).
-  //Estado = digitalRead(MInit);               // <<< Si quieres controlar por BLE, COMENTA ESTA LÍNEA
+  //Estado = digitalRead(MInit);  // Si deseas control SOLO por BLE, deja comentada esta línea
 
   while (Estado) {
-    // Actualiza estado dentro del bucle (sigue leyendo el botón)
-    //Estado = digitalRead(MInit);            // <<< Si usas BLE para Estado, comenta también esta línea
+    //Estado = digitalRead(MInit); // idem comentario anterior
 
     Tinicio  = millis();
     Salida   = Lectura_Sensor();            // actualiza lastRawLine/lastSalidaNorm
     Control  = Controlador(Referencia, Salida);
     Esfuerzo_Control(Control);
     Tm       = Tiempo_Muestreo(Tinicio);
-    // Turbina fija por ValTurb (o usa Esfuerzo_Turbina())
+
     if(is_Servo){
       myTurbina.write(ValTurb);
-      // Esfuerzo_Turbina();
     }else{
       ledcWrite(Canales[2], ValTurb);
-      // Esfuerzo_Turbina();
     }
-    // Refresca valor legible CH2 (sin notify)
     ActualizarLecturasCache();
   }
 
@@ -323,7 +341,8 @@ void loop() {
 float Lectura_Sensor(void) {
   // Lee ponderado (0..15000) y llena sensorValues (calibrados 0..1000)
   uint16_t pos = qtra.readLine(sensorValues);
-  pos = 15000 - pos;
+  //pos = 15000 - pos;
+
   // Señal por sensor para decidir si hay línea (máximo y suma)
   uint16_t maxv = 0;
   uint32_t sumv = 0;
@@ -335,8 +354,8 @@ float Lectura_Sensor(void) {
 
   // Histéresis para "línea presente"
   bool lineNow = hadLine
-                 ? (maxv > QTR_DETECT_TH_OFF)   // mantener con menos señal
-                 : (maxv > QTR_DETECT_TH_ON);   // aparecer con más señal
+                 ? (maxv > qtr_th_off)   // mantener con menos señal
+                 : (maxv > qtr_th_on);   // aparecer con más señal
   hadLine = lineNow;
 
   // Si no hay línea, mantenemos última válida (evita salto a 0/15000 del readLine)
@@ -360,9 +379,10 @@ float Lectura_Sensor(void) {
 
 void ActualizarLecturasCache() {
   if (!pCharacteristic_2) return;
-  char sbuf[64];
-  snprintf(sbuf, sizeof(sbuf), "salida=%.3f,raw=%.0f",
-           (double)lastSalidaNorm, (double)lastRawLine);
+  char sbuf[96];
+  snprintf(sbuf, sizeof(sbuf), "salida=%.3f,raw=%.0f,th_on=%u,th_off=%u",
+           (double)lastSalidaNorm, (double)lastRawLine,
+           (unsigned)qtr_th_on, (unsigned)qtr_th_off);
   pCharacteristic_2->setValue((uint8_t*)sbuf, strlen(sbuf));
 }
 
@@ -373,9 +393,8 @@ float Controlador(float Ref, float Y) {
 
   Error = Ref - Y;
 
-  
   // Zona muerta +/-0.1
-  if ((Error > -0.1f && Error < 0.0f) || (Error > 0.0f && Error < 0.1f)) {
+  if ((Error > -0.15f && Error < 0.0f) || (Error > 0.0f && Error < 0.15f)) {
     Error = 0.0f;
   }
 
@@ -407,14 +426,9 @@ void Esfuerzo_Control(float U) {
   ledcWrite(Canales[0], pwm1);
   ledcWrite(Canales[1], pwm2);
 
-  // Direcciones
-  /*
-  digitalWrite(DirD, (s1 <= 0.0f) ? HIGH  : LOW);
-  digitalWrite(DirI, (s2 <= 0.0f) ? HIGH  : LOW);*/
-  
+  // Direcciones (ajustadas a tu driver)
   digitalWrite(DirD, (s1 <= 0.0f) ? LOW  : HIGH);
   digitalWrite(DirI, (s2 <= 0.0f) ? LOW  : HIGH);
-  
 }
 
 // Turbina proporcional al |Error| (opcional)
@@ -426,7 +440,6 @@ void Esfuerzo_Turbina(){
   }else{
     ledcWrite(Canales[2], (int)estur);
   }
-  
 }
 
 unsigned long Tiempo_Muestreo(unsigned long TinicioRef) {
@@ -443,7 +456,6 @@ void CrearPWM() {
     ledcAttachPin(Tur, Canales[2]);
   }
 }
-
 
 //PARA TURBINA COMO SERVO
 void Inicializacion_turbina() {
@@ -493,7 +505,7 @@ void Inicializacion_Bluetooth() {
   );
   pCharacteristic->setCallbacks(new MyCallbacks_1());
   {
-    char pbuf[120];
+    char pbuf[160];
     snprintf(pbuf, sizeof(pbuf),
              "kp=%.3f,ti=%.3f,td=%.3f,vmax=%.0f,valturb=%d,offset=%.3f,ktur=%.3f",
              (double)Kp, (double)Ti, (double)Td, (double)Vmax, ValTurb,
@@ -508,9 +520,10 @@ void Inicializacion_Bluetooth() {
   );
   pCharacteristic_2->setCallbacks(new MyCallbacks_2());
   {
-    char sbuf[64];
-    snprintf(sbuf, sizeof(sbuf), "salida=%.3f,raw=%.0f",
-             (double)lastSalidaNorm, (double)lastRawLine);
+    char sbuf[96];
+    snprintf(sbuf, sizeof(sbuf), "salida=%.3f,raw=%.0f,th_on=%u,th_off=%u",
+             (double)lastSalidaNorm, (double)lastRawLine,
+             (unsigned)qtr_th_on, (unsigned)qtr_th_off);
     pCharacteristic_2->setValue((uint8_t*)sbuf, strlen(sbuf));
   }
 
