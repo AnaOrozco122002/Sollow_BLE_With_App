@@ -287,7 +287,7 @@ void setup() {
     minvaltur = 50;
     maxvaltur = 180;
   }else{
-    minvaltur = 10;
+    minvaltur = 0;
     maxvaltur = 900;
   }
 

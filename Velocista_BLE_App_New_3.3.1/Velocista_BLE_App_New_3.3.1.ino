@@ -25,10 +25,10 @@ const int Tur = D4; // PIN PWM o Servo
 
 int   ValTurb = 0;
 
-bool is_Servo = false; //false para ser PWM (Nuevo Sollow), true para ser servo (viejo sollow)
+bool is_Servo = false; // false para ser PWM (Nuevo Sollow), true para servo (Viejo Sollow)
 
-int minvaltur=0;
-int maxvaltur=0;
+int minvaltur = 0;
+int maxvaltur = 0;
 
 float KTurb = 0.6f; // (si usas Esfuerzo_Turbina)
 
@@ -72,10 +72,9 @@ float lastRawLine    = 0.0f;  // ponderada 0..~15000
 String datos;     // buffer para sintonización CH1
 String S_offset;  // buffer para offset
 
-// ======================= PWM Motores =======================
-const uint16_t Frecuencia = 5000;
-const byte     Canales[]  = { 0, 1 , 2};
-const byte     Resolucion = 10;
+// ======================= PWM Motores (Arduino PWM API) =======================
+const uint16_t Frecuencia = 5000;   // Hz
+const uint8_t  Resolucion = 10;     // bits (0..1023)
 
 const int PWMI = D5; // Motor Izquierdo PWM
 const int PWMD = D8; // Motor Derecho  PWM
@@ -111,12 +110,12 @@ static String rtrim(const String& s) {
 // Característica 1: Kp,Ti,Td,Vmax,ValTurb,(KTurb opcional)
 class MyCallbacks_1 : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pc) override {
-    std::string value = pc->getValue();
-    if (value.empty()) return;
+    String value = pc->getValue();
+    if (value.length() == 0) return;
 
     if (value[0] == '*') datos = ""; // nuevo comando
 
-    datos += String(value.c_str());
+    datos += value;
     datos.replace("-", ".");   // compat decimal
     int nl = datos.indexOf('\n');
     if (nl >= 0) datos = datos.substring(0, nl);
@@ -175,10 +174,10 @@ class MyCallbacks_1 : public BLECharacteristicCallbacks {
 // Característica 2: WRITE para offset/estado/umbrales; READ para lecturas de sensor + umbrales
 class MyCallbacks_2 : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pc2) override {
-    std::string value = pc2->getValue();
-    if (value.empty()) return;
+    String value = pc2->getValue();
+    if (value.length() == 0) return;
 
-    S_offset = String(value.c_str());
+    S_offset = value;
     S_offset.replace("-", "."); // compat
     S_offset.trim();
 
@@ -276,17 +275,17 @@ void Inicializacion_Bluetooth();
 // ======================= SETUP =======================
 void setup() {
   Serial.begin(115200);
-  
-  if(is_Servo){
+
+  if (is_Servo) {
     minvaltur = 50;
     maxvaltur = 180;
-  }else{
+  } else {
     minvaltur = 0;
     maxvaltur = 900;
   }
 
   Inicializacion_Pines();
-  if(is_Servo){
+  if (is_Servo) {
     Inicializacion_turbina();
   }
   Inicializacion_Sensores();
@@ -295,19 +294,19 @@ void setup() {
 
   delay(300);
 
-  if(is_Servo){
+  if (is_Servo) {
     myTurbina.write(ValTurb); // posición inicial
-  }else{
-    ledcWrite(Canales[2], ValTurb);
+  } else {
+    analogWrite(Tur, ValTurb);
   }
 }
 
 // ======================= LOOP =======================
 void loop() {
-  //Estado = digitalRead(MInit);  // Si deseas control SOLO por BLE, deja comentada esta línea
+  // Estado = digitalRead(MInit);  // Si deseas control SOLO por BLE, deja comentada esta línea
 
   while (Estado) {
-    //Estado = digitalRead(MInit); // idem comentario anterior
+    // Estado = digitalRead(MInit); // idem comentario anterior
 
     Tinicio  = millis();
     Salida   = Lectura_Sensor();            // actualiza lastRawLine/lastSalidaNorm
@@ -315,23 +314,23 @@ void loop() {
     Esfuerzo_Control(Control);
     Tm       = Tiempo_Muestreo(Tinicio);
 
-    if(is_Servo){
+    if (is_Servo) {
       myTurbina.write(ValTurb);
-    }else{
-      ledcWrite(Canales[2], ValTurb);
+    } else {
+      analogWrite(Tur, ValTurb);
     }
     ActualizarLecturasCache();
   }
 
   // Al salir del while => APAGA motores y turbina
-  ledcWrite(Canales[0], 0);
-  ledcWrite(Canales[1], 0);
-  if(is_Servo){
+  analogWrite(PWMI, 0);
+  analogWrite(PWMD, 0);
+  if (is_Servo) {
     myTurbina.write(0);
-  }else{
-    ledcWrite(Canales[2], 0);
+  } else {
+    analogWrite(Tur, 0);
   }
-  
+
   ActualizarLecturasCache();
 }
 
@@ -341,7 +340,6 @@ void loop() {
 float Lectura_Sensor(void) {
   // Lee ponderado (0..15000) y llena sensorValues (calibrados 0..1000)
   uint16_t pos = qtra.readLine(sensorValues);
-  //pos = 15000 - pos;
 
   // Señal por sensor para decidir si hay línea (máximo y suma)
   uint16_t maxv = 0;
@@ -361,7 +359,7 @@ float Lectura_Sensor(void) {
   // Si no hay línea, mantenemos última válida (evita salto a 0/15000 del readLine)
   uint16_t posStable = lineNow ? pos : lastPosRaw;
 
-  // Inversión Izq/Der 
+  // Inversión Izq/Der
   if (QTR_INVERT_LR) {
     posStable = QTR_MAX_POS - posStable;
   }
@@ -423,8 +421,8 @@ void Esfuerzo_Control(float U) {
   int pwm1 = floor(constrain(fabs(s1), 0.0f, 1.0f) * Vmax);
   int pwm2 = floor(constrain(fabs(s2), 0.0f, 1.0f) * Vmax);
 
-  ledcWrite(Canales[0], pwm1);
-  ledcWrite(Canales[1], pwm2);
+  analogWrite(PWMD, pwm1);
+  analogWrite(PWMI, pwm2);
 
   // Direcciones (ajustadas a tu driver)
   digitalWrite(DirD, (s1 <= 0.0f) ? LOW  : HIGH);
@@ -432,13 +430,13 @@ void Esfuerzo_Control(float U) {
 }
 
 // Turbina proporcional al |Error| (opcional)
-void Esfuerzo_Turbina(){
+void Esfuerzo_Turbina() {
   float estur = constrain(round(minvaltur + ((KTurb * fabs(Error)) * (maxvaltur - minvaltur))),
                           (float)minvaltur, (float)maxvaltur);
-  if(is_Servo){
+  if (is_Servo) {
     myTurbina.write((int)estur);
-  }else{
-    ledcWrite(Canales[2], (int)estur);
+  } else {
+    analogWrite(Tur, (int)estur);
   }
 }
 
@@ -447,17 +445,23 @@ unsigned long Tiempo_Muestreo(unsigned long TinicioRef) {
 }
 
 void CrearPWM() {
-  ledcSetup(Canales[0], Frecuencia, Resolucion);
-  ledcSetup(Canales[1], Frecuencia, Resolucion);
-  ledcSetup(Canales[2], Frecuencia, Resolucion);
-  ledcAttachPin(PWMD, Canales[0]); // CH0 -> Motor Derecho
-  ledcAttachPin(PWMI, Canales[1]); // CH1 -> Motor Izquierdo
-  if(!is_Servo){
-    ledcAttachPin(Tur, Canales[2]);
-  }
+  // Resolución por pin (10 bits)
+  analogWriteResolution(PWMD, Resolucion);
+  analogWriteResolution(PWMI, Resolucion);
+  if (!is_Servo) analogWriteResolution(Tur, Resolucion);
+
+  // Frecuencia por pin (5 kHz)
+  analogWriteFrequency(PWMD, Frecuencia);
+  analogWriteFrequency(PWMI, Frecuencia);
+  if (!is_Servo) analogWriteFrequency(Tur, Frecuencia);
+
+  // Asegura 0 al inicio
+  analogWrite(PWMD, 0);
+  analogWrite(PWMI, 0);
+  if (!is_Servo) analogWrite(Tur, 0);
 }
 
-//PARA TURBINA COMO SERVO
+// PARA TURBINA COMO SERVO
 void Inicializacion_turbina() {
   ESP32PWM::allocateTimer(2);
   myTurbina.setPeriodHertz(50);
@@ -477,16 +481,13 @@ void Inicializacion_Pines() {
   pinMode(PWMI, OUTPUT);
   pinMode(DirI, OUTPUT);
   pinMode(DirD, OUTPUT);
-  pinMode(MInit, INPUT); // << como lo tenías
-  if(!is_Servo){
+  pinMode(MInit, INPUT);
+  if (!is_Servo) {
     pinMode(Tur, OUTPUT);
-    ledcWrite(Canales[2], 0);
   }
   // Estados iniciales seguros
   digitalWrite(DirI, LOW);
   digitalWrite(DirD, LOW);
-  ledcWrite(Canales[0], 0);
-  ledcWrite(Canales[1], 0);
 }
 
 void Inicializacion_Bluetooth() {
