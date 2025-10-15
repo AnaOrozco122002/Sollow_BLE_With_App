@@ -70,11 +70,11 @@ unsigned int sensorValues[NUM_SENSORS];
 
 // ======= Robustez ponderado (anti-saltos a 0/15000 cuando se pierde la línea) =======
 const uint16_t QTR_MAX_POS   = (NUM_SENSORS - 1) * 1000; // 15*1000 = 15000
-const bool     QTR_INVERT_LR = false; // true si tu arreglo quedó espejado (invierte IZQ/DER)
+const bool     QTR_INVERT_LR = false; // true si tu arreglo quedó espejado (invierte IZQ/DER) Invertir sensor LUCHO
 
 // Umbrales AJUSTABLES por BLE (rango 0..1000 tras calibración)
-uint16_t qtr_th_on  = 520;  // "apareció" línea
-uint16_t qtr_th_off = 320;  // "desapareció" línea (histeresis) -> debe ser < qtr_th_on
+uint16_t qtr_th_on  = 570;  // "apareció" línea
+uint16_t qtr_th_off = 330;  // "desapareció" línea (histeresis) -> debe ser < qtr_th_on
 
 static uint16_t lastPosRaw = QTR_MAX_POS / 2; // última pos válida (centro=7500)
 static bool     hadLine    = true;            // estado "hay línea" con histéresis
