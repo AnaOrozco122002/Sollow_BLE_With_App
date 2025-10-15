@@ -60,9 +60,9 @@ static bool     hadLine    = true;            // estado "hay línea" con histér
 
 // ======================= CONTROL =======================
 float Tm = 4.0f; // ms (medido por loop)
-float Referencia = 0.0f, Control = 0.0f, Kp = 2.0f, Ti = 0.0f, Td = 0.02f;
+float Referencia = 0.0f, Control = 0.0f, Kp = 3.2f, Ti = 0.0f, Td = 0.02f;
 float Salida = 0.0f, Error = 0.0f, Error_ant = 0.0f;
-float offset = 1.0f, Vmax = 100.0f, E_integral = 0.0f;
+float offset = 1.0f, Vmax = 50.0f, E_integral = 0.0f;
 
 // Cache de lecturas para BLE (evita recomputos en READ)
 float lastSalidaNorm = 0.0f;  // normalizada [-1, +1]
@@ -304,10 +304,10 @@ void setup() {
 
 // ======================= LOOP =======================
 void loop() {
-  //Estado = digitalRead(MInit);  // Si deseas control SOLO por BLE, deja comentada esta línea
+  Estado = digitalRead(MInit);  // Si deseas control SOLO por BLE, deja comentada esta línea
 
   while (Estado) {
-    //Estado = digitalRead(MInit); // idem comentario anterior
+    Estado = digitalRead(MInit); // idem comentario anterior
 
     Tinicio  = millis();
     Salida   = Lectura_Sensor();            // actualiza lastRawLine/lastSalidaNorm

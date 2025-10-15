@@ -7,10 +7,31 @@
 #include <BLEServer.h>
 #include <math.h>   // por fabs()
 
-// ======================= BLE UUIDs =======================
-#define SERVICE_UUID          "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define CHARACTERISTIC_UUID   "beb5483e-36e1-4688-b7f5-ea07361b26a8" // CH1: PID/Vmax/ValTurb/(KTurb opcional) (READ/WRITE)
-#define CHARACTERISTIC_UUID_2 "ceb5483e-36e1-4688-b7f5-ea07361b26a8" // CH2: Offset/Estado/THs (WRITE) + Lecturas (READ)
+
+
+//#define ROBOT_VARIANT_ZENIT
+#define ROBOT_VARIANT_SOLLOW_OLD
+
+#if defined(ROBOT_VARIANT_ZENIT)
+// ---------- ZENIT (nuevo) ----------
+#define FW_BLE_NAME         "ZENIT"  // <— nombre visible en el escaneo
+#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define CHARACTERISTIC_UUID_2 "ceb5483e-36e1-4688-b7f5-ea07361b26a8"
+static bool is_Servo = false; // PWM turbina (nuevo)
+
+#elif defined(ROBOT_VARIANT_SOLLOW_OLD)
+// ---------- SOLLOW (viejo) ----------
+#define FW_BLE_NAME         "SOLLOW" // <— nombre visible en el escaneo
+#define SERVICE_UUID        "4fafc201-1fb5-120e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID "beb5483e-36e1-120e-b7f5-ea07361b26a8"
+#define CHARACTERISTIC_UUID_2 "ceb5483e-36e1-120e-b7f5-ea07361b26a8"
+static bool is_Servo = true;  // servo turbina (viejo)
+
+#else
+#error "Define ROBOT_VARIANT_ZENIT o ROBOT_VARIANT_SOLLOW_OLD"
+#endif
+
 
 BLECharacteristic *pCharacteristic;    // CH1
 BLECharacteristic *pCharacteristic_2;  // CH2
@@ -25,7 +46,7 @@ const int Tur = D4; // PIN PWM o Servo
 
 int   ValTurb = 0;
 
-bool is_Servo = false; // false para ser PWM (Nuevo Sollow), true para servo (Viejo Sollow)
+//bool is_Servo = false; // false para ser PWM (Nuevo Sollow), true para servo (Viejo Sollow)
 
 int minvaltur = 0;
 int maxvaltur = 0;
@@ -60,9 +81,9 @@ static bool     hadLine    = true;            // estado "hay línea" con histér
 
 // ======================= CONTROL =======================
 float Tm = 4.0f; // ms (medido por loop)
-float Referencia = 0.0f, Control = 0.0f, Kp = 2.0f, Ti = 0.0f, Td = 0.02f;
+float Referencia = 0.0f, Control = 0.0f, Kp = 3.2f, Ti = 0.0f, Td = 0.02f;
 float Salida = 0.0f, Error = 0.0f, Error_ant = 0.0f;
-float offset = 1.0f, Vmax = 100.0f, E_integral = 0.0f;
+float offset = 1.0f, Vmax = 0.0f, E_integral = 0.0f;
 
 // Cache de lecturas para BLE (evita recomputos en READ)
 float lastSalidaNorm = 0.0f;  // normalizada [-1, +1]
@@ -277,7 +298,7 @@ void setup() {
   Serial.begin(115200);
 
   if (is_Servo) {
-    minvaltur = 50;
+    minvaltur = 0;
     maxvaltur = 180;
   } else {
     minvaltur = 0;
@@ -303,10 +324,10 @@ void setup() {
 
 // ======================= LOOP =======================
 void loop() {
-  // Estado = digitalRead(MInit);  // Si deseas control SOLO por BLE, deja comentada esta línea
+  //Estado = digitalRead(MInit);  // Si deseas control SOLO por BLE, deja comentada esta línea
 
   while (Estado) {
-    // Estado = digitalRead(MInit); // idem comentario anterior
+    //Estado = digitalRead(MInit); // idem comentario anterior
 
     Tinicio  = millis();
     Salida   = Lectura_Sensor();            // actualiza lastRawLine/lastSalidaNorm
@@ -340,7 +361,7 @@ void loop() {
 float Lectura_Sensor(void) {
   // Lee ponderado (0..15000) y llena sensorValues (calibrados 0..1000)
   uint16_t pos = qtra.readLine(sensorValues);
-
+  //pos = 15000-pos;
   // Señal por sensor para decidir si hay línea (máximo y suma)
   uint16_t maxv = 0;
   uint32_t sumv = 0;
@@ -491,7 +512,7 @@ void Inicializacion_Pines() {
 }
 
 void Inicializacion_Bluetooth() {
-  BLEDevice::init("SOLLOW");
+  BLEDevice::init(FW_BLE_NAME);
   BLEDevice::setMTU(185);
 
   BLEServer *pServer = BLEDevice::createServer();
@@ -535,5 +556,8 @@ void Inicializacion_Bluetooth() {
   pAdvertising->setScanResponse(true);
   pAdvertising->start();
 
-  Serial.println("BLE Advertising iniciado (SOLLOW).");
+  Serial.print("BLE Advertising iniciado (");
+  Serial.print(FW_BLE_NAME);
+  Serial.println(").");
+
 }
