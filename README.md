@@ -1,4 +1,4 @@
-# XIAO ESP32‑S3 Line Follower (BLE) — README
+# XIAO ESP32‑S3 Line Follower (BLE)
 
 > Firmware para un carro seguidor de línea con **Seeed XIAO ESP32‑S3**, arreglo **QTR x16** con **MUX**, control **PID** y **turbina** (servo o PWM). Expone un **servicio BLE** para sintonía en tiempo real (Kp/Ti/Td/Vmax/offset/umbrales) y telemetría básica.
 
