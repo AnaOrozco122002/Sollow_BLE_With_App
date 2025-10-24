@@ -20,10 +20,10 @@ void setup() {
   //Serial.begin(9600);
   // Dirección fija en 0 (si no conectas este pin, puedes puentear DIR a GND en el IFX)
   pinMode(PIN_DIR_D, OUTPUT);
-  digitalWrite(PIN_DIR_D, LOW);
+  
 
   pinMode(PIN_DIR_I, OUTPUT);
-  digitalWrite(PIN_DIR_I, LOW);
+  
 
   // Configura LEDC en ESP32
   /*ledcSetup(PWM_CHANNEL_D, PWM_FREQ, PWM_RES);
@@ -54,6 +54,10 @@ void setup() {
 
 void loop() {
   // Rampa de aceleración
+  digitalWrite(PIN_DIR_D, LOW);
+  digitalWrite(PIN_DIR_I, LOW);
+  
+
   for (int duty = 0; duty <= (1 << PWM_RES) - 1; duty += 16) {
     analogWrite(PIN_PWM_D, duty);
     analogWrite(PIN_PWM_I, duty);
@@ -93,6 +97,30 @@ void loop() {
   }*/
 
   // Pausa con motor apagado
+  delay(1500);
+
+  digitalWrite(PIN_DIR_D, HIGH);
+  digitalWrite(PIN_DIR_I, HIGH);
+  
+
+  for (int duty = 0; duty <= (1 << PWM_RES) - 1; duty += 16) {
+    analogWrite(PIN_PWM_D, duty);
+    analogWrite(PIN_PWM_I, duty);
+    //Serial.println(duty);
+    delay(30);
+  }
+
+  // Mantén alta velocidad 2 s
+  delay(2000);
+
+  // Rampa de desaceleración
+  for (int duty = (1 << PWM_RES) - 1; duty >= 0; duty -= 16) {
+    analogWrite(PIN_PWM_D, duty);
+    analogWrite(PIN_PWM_I, duty);
+    //Serial.println(duty);
+    delay(30);
+  }
+
   delay(1500);
 }
 
