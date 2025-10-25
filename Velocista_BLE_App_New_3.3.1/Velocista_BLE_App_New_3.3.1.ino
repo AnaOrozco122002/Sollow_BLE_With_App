@@ -84,6 +84,7 @@ float Tm = 4.0f; // ms (medido por loop)
 float Referencia = 0.0f, Control = 0.0f, Kp = 3.2f, Ti = 0.0f, Td = 0.02f;
 float Salida = 0.0f, Error = 0.0f, Error_ant = 0.0f;
 float offset = 1.0f, Vmax = 0.0f, E_integral = 0.0f;
+bool entloop=false;
 
 // Cache de lecturas para BLE (evita recomputos en READ)
 float lastSalidaNorm = 0.0f;  // normalizada [-1, +1]
@@ -303,7 +304,7 @@ void setup() {
     maxvaltur = 180;
   } else {
     minvaltur = 0;
-    maxvaltur = 900;
+    maxvaltur = 950;
   }
 
   Inicializacion_Pines();
@@ -329,7 +330,7 @@ void loop() {
 
   while (Estado) {
     //Estado = digitalRead(MInit); // idem comentario anterior
-
+    entloop=true;
     Tinicio  = millis();
     Salida   = Lectura_Sensor();            // actualiza lastRawLine/lastSalidaNorm
     Control  = Controlador(Referencia, Salida);
@@ -347,10 +348,12 @@ void loop() {
   // Al salir del while => APAGA motores y turbina
   analogWrite(PWMI, 0);
   analogWrite(PWMD, 0);
-  if (is_Servo) {
-    myTurbina.write(0);
-  } else {
-    analogWrite(Tur, 0);
+  if(entloop){
+    if (is_Servo) {
+      myTurbina.write(0);
+    } else {
+      analogWrite(Tur, 0);
+    }
   }
 
   ActualizarLecturasCache();

@@ -86,7 +86,7 @@ float Salida = 0.0f, Error = 0.0f, Error_ant = 0.0f;
 float offset = 1.0f, Vmax = 0.0f, E_integral = 0.0f;
 int activesensors = 0;
 int last_s=-1, first_s=-1;
-bool extreme=false;
+bool extreme=false, entloop=false;
 
 // Cache de lecturas para BLE (evita recomputos en READ)
 float lastSalidaNorm = 0.0f;  // normalizada [-1, +1]
@@ -332,7 +332,7 @@ void loop() {
 
   while (Estado) {
     //Estado = digitalRead(MInit); // idem comentario anterior
-
+    entloop=true;
     Tinicio  = millis();
     Salida   = Lectura_Sensor();            // actualiza lastRawLine/lastSalidaNorm
     extreme = ReturnExtreme();
@@ -351,12 +351,13 @@ void loop() {
   // Al salir del while => APAGA motores y turbina
   analogWrite(PWMI, 0);
   analogWrite(PWMD, 0);
-  if (is_Servo) {
-    myTurbina.write(0);
-  } else {
-    analogWrite(Tur, 0);
+  if(entloop){
+    if (is_Servo) {
+      myTurbina.write(0);
+    } else {
+      analogWrite(Tur, 0);
+    }
   }
-
   ActualizarLecturasCache();
 }
 
