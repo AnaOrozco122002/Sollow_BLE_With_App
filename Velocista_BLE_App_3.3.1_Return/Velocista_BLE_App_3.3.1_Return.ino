@@ -84,6 +84,9 @@ float Tm = 4.0f; // ms (medido por loop)
 float Referencia = 0.0f, Control = 0.0f, Kp = 3.2f, Ti = 0.0f, Td = 0.02f;
 float Salida = 0.0f, Error = 0.0f, Error_ant = 0.0f;
 float offset = 1.0f, Vmax = 0.0f, E_integral = 0.0f;
+int activesensors = 0;
+int last_s=-1, first_s=-1;
+bool extreme=false;
 
 // Cache de lecturas para BLE (evita recomputos en READ)
 float lastSalidaNorm = 0.0f;  // normalizada [-1, +1]
@@ -95,7 +98,7 @@ String S_offset;  // buffer para offset
 
 // ======================= PWM Motores (Arduino PWM API) =======================
 const uint16_t Frecuencia = 2500;   // Hz
-const uint16_t Frecuencia_T = 500;
+const uint16_t Frecuencia_T = 500; 
 const uint8_t  Resolucion = 10;     // bits (0..1023)
 
 const int PWMI = D5; // Motor Izquierdo PWM
@@ -303,7 +306,7 @@ void setup() {
     maxvaltur = 180;
   } else {
     minvaltur = 0;
-    maxvaltur = 900;
+    maxvaltur = 950;
   }
 
   Inicializacion_Pines();
@@ -332,6 +335,7 @@ void loop() {
 
     Tinicio  = millis();
     Salida   = Lectura_Sensor();            // actualiza lastRawLine/lastSalidaNorm
+    extreme = ReturnExtreme();
     Control  = Controlador(Referencia, Salida);
     Esfuerzo_Control(Control);
     Tm       = Tiempo_Muestreo(Tinicio);
@@ -397,6 +401,40 @@ float Lectura_Sensor(void) {
   return Salida;
 }
 
+bool ReturnExtreme(){
+  activesensors=0;
+  first_s=-1;
+  last_s=-1;
+  for (int i = 0; i < 16; i++) {
+    if (sensorValues[i] > qtr_th_on) {
+      activesensors++;
+      if (first_s == -1) {
+          first_s = i;
+      }
+      last_s = i;
+    }
+  }
+  if (activesensors == 0) {
+    if (Error_ant > 0.15f) { // Zona muerta al error previo
+      digitalWrite(DirD,LOW);
+      digitalWrite(DirI,HIGH);
+      analogWrite(PWMD, Vmax);
+      analogWrite(PWMI, Vmax); // Gira a la derecha
+    } else if (Error_ant < -0.15f) {
+      digitalWrite(DirD,HIGH);
+      digitalWrite(DirI,LOW);
+      analogWrite(PWMD, Vmax);
+      analogWrite(PWMI, Vmax); // Gira a la izquierda
+    } else {
+        // Si el último error era casi cero
+      analogWrite(PWMD, 0);
+      analogWrite(PWMI, 0);
+    }
+    return true; // Se manejó un caso extremo.
+  }
+  return false;
+}
+
 void ActualizarLecturasCache() {
   if (!pCharacteristic_2) return;
   char sbuf[96];
@@ -443,12 +481,14 @@ void Esfuerzo_Control(float U) {
   int pwm1 = floor(constrain(fabs(s1), 0.0f, 1.0f) * Vmax);
   int pwm2 = floor(constrain(fabs(s2), 0.0f, 1.0f) * Vmax);
 
-  analogWrite(PWMD, pwm1);
-  analogWrite(PWMI, pwm2);
+  if(!extreme){
+    analogWrite(PWMD, pwm1);
+    analogWrite(PWMI, pwm2);
 
-  // Direcciones (ajustadas a tu driver)
-  digitalWrite(DirD, (s1 <= 0.0f) ? LOW  : HIGH);
-  digitalWrite(DirI, (s2 <= 0.0f) ? LOW  : HIGH);
+    // Direcciones (ajustadas a tu driver)
+    digitalWrite(DirD, (s1 <= 0.0f) ? LOW  : HIGH);
+    digitalWrite(DirI, (s2 <= 0.0f) ? LOW  : HIGH);
+  }
 }
 
 // Turbina proporcional al |Error| (opcional)
